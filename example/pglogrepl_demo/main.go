@@ -131,6 +131,17 @@ func main() {
 
 	applyCtx := applyContext{conn: targetConn, lastCommitTime: time.Now()}
 
+	walDataCh := make(chan []byte, 1024)
+	go func() {
+		for walData := range walDataCh {
+			if v2 {
+				processV2(walData, relationsV2, typeMap, &inStream, &applyCtx)
+			} else {
+				processV1(walData, relations, typeMap, &applyCtx)
+			}
+		}
+	}()
+
 	for {
 		if time.Now().After(nextStandbyMessageDeadline) {
 			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
@@ -183,11 +194,9 @@ func main() {
 			if outputPlugin == "wal2json" {
 				log.Printf("wal2json data: %s\n", string(xld.WALData))
 			} else {
-				if v2 {
-					processV2(xld.WALData, relationsV2, typeMap, &inStream, &applyCtx)
-				} else {
-					processV1(xld.WALData, relations, typeMap, &applyCtx)
-				}
+				walDataCp := make([]byte, len(xld.WALData))
+				copy(walDataCp, xld.WALData)
+				walDataCh <- walDataCp
 			}
 
 			if xld.WALStart > clientXLogPos {
