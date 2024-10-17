@@ -5,35 +5,76 @@ import (
 	"log"
 	"os"
 	"time"
+	"fmt"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
+func createReplicationOrigin(conn *pgx.Conn, name string) error {
+	// create origin if not exists
+	q := `SELECT * FROM pg_replication_origin WHERE roname = $1`
+	row := conn.QueryRow(context.Background(), q, name)
+	var originID uint64
+	err := row.Scan(&originID)
+	if err == pgx.ErrNoRows {
+		q := `SELECT pg_replication_origin_create($1)`
+		_, err = conn.Exec(context.Background(), q, name)
+		if err != nil {
+			return err
+		}
+	}
+
+	q = `SELECT pg_replication_origin_session_setup($1)`
+	_, err = conn.Exec(context.Background(), q, name)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func main() {
+	go func() {
+        log.Println(http.ListenAndServe("localhost:6060", nil))
+  }()
+
 	//	const outputPlugin = "test_decoding"
 	const outputPlugin = "pgoutput"
 	//const outputPlugin = "wal2json"
-	conn, err := pgconn.Connect(context.Background(), os.Getenv("PGLOGREPL_DEMO_CONN_STRING"))
+	targetConn, err := pgx.Connect(context.Background(), os.Getenv("TARGET"))
+	if err != nil {
+		log.Fatalln("failed to connect to PostgreSQL server:", err)
+	}
+
+	err = createReplicationOrigin(targetConn, "pglogrepl_demo")
+	if err != nil {
+		log.Fatalln("failed to create replication origin:", err)
+	}
+
+	conn, err := pgconn.Connect(context.Background(), os.Getenv("SOURCE"))
 	if err != nil {
 		log.Fatalln("failed to connect to PostgreSQL server:", err)
 	}
 	defer conn.Close(context.Background())
 
-	result := conn.Exec(context.Background(), "DROP PUBLICATION IF EXISTS pglogrepl_demo;")
-	_, err = result.ReadAll()
-	if err != nil {
-		log.Fatalln("drop publication if exists error", err)
-	}
+	// result := conn.Exec(context.Background(), "DROP PUBLICATION IF EXISTS pglogrepl_demo;")
+	// _, err = result.ReadAll()
+	// if err != nil {
+	// 	log.Fatalln("drop publication if exists error", err)
+	// }
 
-	result = conn.Exec(context.Background(), "CREATE PUBLICATION pglogrepl_demo FOR ALL TABLES;")
-	_, err = result.ReadAll()
-	if err != nil {
-		log.Fatalln("create publication error", err)
-	}
-	log.Println("create publication pglogrepl_demo")
+	// result = conn.Exec(context.Background(), "CREATE PUBLICATION pglogrepl_demo FOR ALL TABLES;")
+	// _, err = result.ReadAll()
+	// if err != nil {
+	// 	log.Fatalln("create publication error", err)
+	// }
+	// log.Println("create publication pglogrepl_demo")
 
 	var pluginArguments []string
 	var v2 bool
@@ -88,6 +129,19 @@ func main() {
 	// on StreamStopMessage we set it back to false
 	inStream := false
 
+	applyCtx := applyContext{conn: targetConn, lastCommitTime: time.Now()}
+
+	walDataCh := make(chan []byte, 1024)
+	go func() {
+		for walData := range walDataCh {
+			if v2 {
+				processV2(walData, relationsV2, typeMap, &inStream, &applyCtx)
+			} else {
+				processV1(walData, relations, typeMap, &applyCtx)
+			}
+		}
+	}()
+
 	for {
 		if time.Now().After(nextStandbyMessageDeadline) {
 			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
@@ -124,7 +178,6 @@ func main() {
 			if err != nil {
 				log.Fatalln("ParsePrimaryKeepaliveMessage failed:", err)
 			}
-			log.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
 			if pkm.ServerWALEnd > clientXLogPos {
 				clientXLogPos = pkm.ServerWALEnd
 			}
@@ -141,12 +194,9 @@ func main() {
 			if outputPlugin == "wal2json" {
 				log.Printf("wal2json data: %s\n", string(xld.WALData))
 			} else {
-				log.Printf("XLogData => WALStart %s ServerWALEnd %s ServerTime %s WALData:\n", xld.WALStart, xld.ServerWALEnd, xld.ServerTime)
-				if v2 {
-					processV2(xld.WALData, relationsV2, typeMap, &inStream)
-				} else {
-					processV1(xld.WALData, relations, typeMap)
-				}
+				walDataCp := make([]byte, len(xld.WALData))
+				copy(walDataCp, xld.WALData)
+				walDataCh <- walDataCp
 			}
 
 			if xld.WALStart > clientXLogPos {
@@ -156,32 +206,64 @@ func main() {
 	}
 }
 
-func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool) {
+type applyContext struct {
+	conn *pgx.Conn
+	tx   pgx.Tx
+	batch pgx.Batch
+	lastCommitTime time.Time
+}
+
+func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool, applyCtx *applyContext) {
 	logicalMsg, err := pglogrepl.ParseV2(walData, *inStream)
 	if err != nil {
 		log.Fatalf("Parse logical replication message: %s", err)
 	}
-	log.Printf("Receive a logical replication message: %s", logicalMsg.Type())
 	switch logicalMsg := logicalMsg.(type) {
 	case *pglogrepl.RelationMessageV2:
 		relations[logicalMsg.RelationID] = logicalMsg
 
 	case *pglogrepl.BeginMessage:
+		// *tx, err = targetConn.Begin(context.Background())
+		// if err != nil {
+		// 	log.Fatalf("failed to start transaction: %v", err)
+		// }
 		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions. You won't get any events from rolled back transactions.
 
 	case *pglogrepl.CommitMessage:
+		// err := (*tx).Commit(context.Background())
+		// if err != nil {
+		// 	log.Fatalf("failed to commit transaction: %v", err)
+		// }
+		if time.Since(applyCtx.lastCommitTime) > 2 * time.Second {
+			q := `select pg_replication_origin_xact_setup($1, $2)`
+			applyCtx.batch.Queue(q, logicalMsg.CommitLSN, logicalMsg.CommitTime)
+			before := time.Now()
+			applyCtx.conn.SendBatch(context.Background(), &applyCtx.batch).Close()
+			log.Printf("commit took %v queue %d", time.Since(before), applyCtx.batch.Len())
+			applyCtx.batch = pgx.Batch{}
+			applyCtx.lastCommitTime = time.Now()
+		}
 
 	case *pglogrepl.InsertMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
 		if !ok {
 			log.Fatalf("unknown relation ID %d", logicalMsg.RelationID)
 		}
-		values := map[string]interface{}{}
+		query := fmt.Sprintf("INSERT INTO %s(", pgx.Identifier{rel.Namespace, rel.RelationName}.Sanitize())
+
+		vals := []interface{}{}
 		for idx, col := range logicalMsg.Tuple.Columns {
-			colName := rel.Columns[idx].Name
+			colName := pgx.Identifier{rel.Columns[idx].Name}.Sanitize()
+
+			if idx == 0 {
+				query += colName
+			} else {
+				query += ", " + colName
+			}
+
 			switch col.DataType {
 			case 'n': // null
-				values[colName] = nil
+				vals = append(vals, nil)
 			case 'u': // unchanged toast
 				// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
 			case 't': //text
@@ -189,11 +271,23 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 				if err != nil {
 					log.Fatalln("error decoding column data:", err)
 				}
-				values[colName] = val
+				vals = append(vals, val)
 			}
 		}
-		log.Printf("insert for xid %d\n", logicalMsg.Xid)
-		log.Printf("INSERT INTO %s.%s: %v", rel.Namespace, rel.RelationName, values)
+		query += ") VALUES("
+		for idx := range logicalMsg.Tuple.Columns {
+			if idx == 0 {
+				query += fmt.Sprintf("$%d", idx+1)
+			} else {
+				query += fmt.Sprintf(", $%d", idx+1)
+			}
+		}
+		query += ")"
+		// _, err := (*tx).Exec(context.Background(), query, vals...)
+		// if err != nil {
+		// 	log.Fatalf("failed to insert into %s.%s: %v", rel.Namespace, rel.RelationName, err)
+		// }
+		(*applyCtx).batch.Queue(query, vals...)
 
 	case *pglogrepl.UpdateMessageV2:
 		log.Printf("update for xid %d\n", logicalMsg.Xid)
@@ -226,7 +320,7 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 	}
 }
 
-func processV1(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, typeMap *pgtype.Map) {
+func processV1(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, typeMap *pgtype.Map, applyCtx *applyContext) {
 	logicalMsg, err := pglogrepl.Parse(walData)
 	if err != nil {
 		log.Fatalf("Parse logical replication message: %s", err)
