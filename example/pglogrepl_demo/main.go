@@ -123,6 +123,7 @@ func main() {
 	inStream := false
 
 	var tx pgx.Tx
+	var batch pgx.Batch
 	for {
 		if time.Now().After(nextStandbyMessageDeadline) {
 			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
@@ -176,7 +177,7 @@ func main() {
 				log.Printf("wal2json data: %s\n", string(xld.WALData))
 			} else {
 				if v2 {
-					processV2(xld.WALData, relationsV2, typeMap, &inStream, targetConn, &tx)
+					processV2(xld.WALData, relationsV2, typeMap, &inStream, targetConn, &tx, &batch)
 				} else {
 					processV1(xld.WALData, relations, typeMap, targetConn, &tx)
 				}
@@ -189,7 +190,7 @@ func main() {
 	}
 }
 
-func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool, targetConn *pgx.Conn, tx *pgx.Tx) {
+func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool, targetConn *pgx.Conn, tx *pgx.Tx, batch *pgx.Batch) {
 	logicalMsg, err := pglogrepl.ParseV2(walData, *inStream)
 	if err != nil {
 		log.Fatalf("Parse logical replication message: %s", err)
@@ -199,17 +200,19 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 		relations[logicalMsg.RelationID] = logicalMsg
 
 	case *pglogrepl.BeginMessage:
-		*tx, err = targetConn.Begin(context.Background())
-		if err != nil {
-			log.Fatalf("failed to start transaction: %v", err)
-		}
+		// *tx, err = targetConn.Begin(context.Background())
+		// if err != nil {
+		// 	log.Fatalf("failed to start transaction: %v", err)
+		// }
 		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions. You won't get any events from rolled back transactions.
 
 	case *pglogrepl.CommitMessage:
-		err := (*tx).Commit(context.Background())
-		if err != nil {
-			log.Fatalf("failed to commit transaction: %v", err)
-		}
+		// err := (*tx).Commit(context.Background())
+		// if err != nil {
+		// 	log.Fatalf("failed to commit transaction: %v", err)
+		// }
+	targetConn.SendBatch(context.Background(), batch).Close()
+	*batch = pgx.Batch{}
 
 	case *pglogrepl.InsertMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
@@ -250,10 +253,11 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 			}
 		}
 		query += ")"
-		_, err := (*tx).Exec(context.Background(), query, vals...)
-		if err != nil {
-			log.Fatalf("failed to insert into %s.%s: %v", rel.Namespace, rel.RelationName, err)
-		}
+		// _, err := (*tx).Exec(context.Background(), query, vals...)
+		// if err != nil {
+		// 	log.Fatalf("failed to insert into %s.%s: %v", rel.Namespace, rel.RelationName, err)
+		// }
+		(*batch).Queue(query, vals...)
 
 	case *pglogrepl.UpdateMessageV2:
 		log.Printf("update for xid %d\n", logicalMsg.Xid)
