@@ -122,8 +122,8 @@ func main() {
 	// on StreamStopMessage we set it back to false
 	inStream := false
 
-	var tx pgx.Tx
-	var batch pgx.Batch
+	applyCtx := applyContext{conn: targetConn, lastCommitTime: time.Now()}
+
 	for {
 		if time.Now().After(nextStandbyMessageDeadline) {
 			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
@@ -177,9 +177,9 @@ func main() {
 				log.Printf("wal2json data: %s\n", string(xld.WALData))
 			} else {
 				if v2 {
-					processV2(xld.WALData, relationsV2, typeMap, &inStream, targetConn, &tx, &batch)
+					processV2(xld.WALData, relationsV2, typeMap, &inStream, &applyCtx)
 				} else {
-					processV1(xld.WALData, relations, typeMap, targetConn, &tx)
+					processV1(xld.WALData, relations, typeMap, &applyCtx)
 				}
 			}
 
@@ -190,7 +190,14 @@ func main() {
 	}
 }
 
-func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool, targetConn *pgx.Conn, tx *pgx.Tx, batch *pgx.Batch) {
+type applyContext struct {
+	conn *pgx.Conn
+	tx   pgx.Tx
+	batch pgx.Batch
+	lastCommitTime time.Time
+}
+
+func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool, applyCtx *applyContext) {
 	logicalMsg, err := pglogrepl.ParseV2(walData, *inStream)
 	if err != nil {
 		log.Fatalf("Parse logical replication message: %s", err)
@@ -211,8 +218,15 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 		// if err != nil {
 		// 	log.Fatalf("failed to commit transaction: %v", err)
 		// }
-	targetConn.SendBatch(context.Background(), batch).Close()
-	*batch = pgx.Batch{}
+		if time.Since(applyCtx.lastCommitTime) > 2 * time.Second {
+			q := `select pg_replication_origin_xact_setup($1, $2)`
+			applyCtx.batch.Queue(q, logicalMsg.CommitLSN, logicalMsg.CommitTime)
+			before := time.Now()
+			applyCtx.conn.SendBatch(context.Background(), &applyCtx.batch).Close()
+			log.Printf("commit took %v queue %d", time.Since(before), applyCtx.batch.Len())
+			applyCtx.batch = pgx.Batch{}
+			applyCtx.lastCommitTime = time.Now()
+		}
 
 	case *pglogrepl.InsertMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
@@ -257,7 +271,7 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 		// if err != nil {
 		// 	log.Fatalf("failed to insert into %s.%s: %v", rel.Namespace, rel.RelationName, err)
 		// }
-		(*batch).Queue(query, vals...)
+		(*applyCtx).batch.Queue(query, vals...)
 
 	case *pglogrepl.UpdateMessageV2:
 		log.Printf("update for xid %d\n", logicalMsg.Xid)
@@ -290,7 +304,7 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 	}
 }
 
-func processV1(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, typeMap *pgtype.Map, targetConn *pgx.Conn, tx *pgx.Tx) {
+func processV1(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, typeMap *pgtype.Map, applyCtx *applyContext) {
 	logicalMsg, err := pglogrepl.Parse(walData)
 	if err != nil {
 		log.Fatalf("Parse logical replication message: %s", err)
