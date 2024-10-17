@@ -12,6 +12,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 func createReplicationOrigin(conn *pgx.Conn, name string) error {
@@ -37,6 +40,10 @@ func createReplicationOrigin(conn *pgx.Conn, name string) error {
 }
 
 func main() {
+	go func() {
+        log.Println(http.ListenAndServe("localhost:6060", nil))
+  }()
+
 	//	const outputPlugin = "test_decoding"
 	const outputPlugin = "pgoutput"
 	//const outputPlugin = "wal2json"
