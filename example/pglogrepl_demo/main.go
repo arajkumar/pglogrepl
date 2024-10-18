@@ -129,15 +129,20 @@ func main() {
 	// on StreamStopMessage we set it back to false
 	inStream := false
 
-	applyCtx := applyContext{conn: targetConn, lastCommitTime: time.Now()}
+	applyCtx := applyContext{conn: targetConn, lastCommitTime: time.Now(), timer: time.NewTimer(2 * time.Second)}
 
 	walDataCh := make(chan []byte, 1024)
 	go func() {
-		for walData := range walDataCh {
-			if v2 {
-				processV2(walData, relationsV2, typeMap, &inStream, &applyCtx)
-			} else {
-				processV1(walData, relations, typeMap, &applyCtx)
+		for {
+			select {
+			case <-applyCtx.timer.C:
+				applyCtx.flush(context.Background())
+			case walData := <-walDataCh:
+				if v2 {
+					processV2(walData, relationsV2, typeMap, &inStream, &applyCtx)
+				} else {
+					processV1(walData, relations, typeMap, &applyCtx)
+				}
 			}
 		}
 	}()
@@ -211,6 +216,42 @@ type applyContext struct {
 	tx   pgx.Tx
 	batch pgx.Batch
 	lastCommitTime time.Time
+	commitLSN pglogrepl.LSN
+	commitTime time.Time
+	txnInProgress bool
+	timer *time.Timer
+}
+
+func (a *applyContext) queue(q string, args ...interface{}) {
+	a.batch.Queue(q, args...)
+}
+
+func (a *applyContext) begin() {
+	a.txnInProgress = true
+}
+
+func (a *applyContext) commit(commitLSN pglogrepl.LSN, commitTime time.Time) {
+	a.commitLSN = commitLSN
+	a.commitTime = commitTime
+	a.txnInProgress = false
+	if time.Since(a.lastCommitTime) > 2 * time.Second {
+		a.flush(context.Background())
+	} else {
+		a.timer.Reset(2 * time.Second)
+	}
+}
+
+func (a *applyContext) flush(ctx context.Context) {
+	if a.batch.Len() == 0 {
+		return
+	}
+	q := `select pg_replication_origin_xact_setup($1, $2)`
+	a.batch.Queue(q, a.commitLSN, a.commitTime)
+	before := time.Now()
+	a.conn.SendBatch(ctx, &a.batch).Close()
+	log.Printf("commit took %v queue %d", time.Since(before), a.batch.Len())
+	a.batch = pgx.Batch{}
+	a.lastCommitTime = time.Now()
 }
 
 func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2, typeMap *pgtype.Map, inStream *bool, applyCtx *applyContext) {
@@ -229,20 +270,13 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 		// }
 		// Indicates the beginning of a group of changes in a transaction. This is only sent for committed transactions. You won't get any events from rolled back transactions.
 
+		applyCtx.begin()
 	case *pglogrepl.CommitMessage:
 		// err := (*tx).Commit(context.Background())
 		// if err != nil {
 		// 	log.Fatalf("failed to commit transaction: %v", err)
 		// }
-		if time.Since(applyCtx.lastCommitTime) > 2 * time.Second {
-			q := `select pg_replication_origin_xact_setup($1, $2)`
-			applyCtx.batch.Queue(q, logicalMsg.CommitLSN, logicalMsg.CommitTime)
-			before := time.Now()
-			applyCtx.conn.SendBatch(context.Background(), &applyCtx.batch).Close()
-			log.Printf("commit took %v queue %d", time.Since(before), applyCtx.batch.Len())
-			applyCtx.batch = pgx.Batch{}
-			applyCtx.lastCommitTime = time.Now()
-		}
+		applyCtx.commit(logicalMsg.CommitLSN, logicalMsg.CommitTime)
 
 	case *pglogrepl.InsertMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
@@ -287,7 +321,7 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 		// if err != nil {
 		// 	log.Fatalf("failed to insert into %s.%s: %v", rel.Namespace, rel.RelationName, err)
 		// }
-		(*applyCtx).batch.Queue(query, vals...)
+		applyCtx.queue(query, vals...)
 
 	case *pglogrepl.UpdateMessageV2:
 		log.Printf("update for xid %d\n", logicalMsg.Xid)
