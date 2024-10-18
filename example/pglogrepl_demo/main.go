@@ -248,7 +248,10 @@ func (a *applyContext) flush(ctx context.Context) {
 	q := `select pg_replication_origin_xact_setup($1, $2)`
 	a.batch.Queue(q, a.commitLSN, a.commitTime)
 	before := time.Now()
-	a.conn.SendBatch(ctx, &a.batch).Close()
+	err := a.conn.SendBatch(ctx, &a.batch).Close()
+	if err != nil {
+		log.Fatalf("failed to apply batch: %v", err)
+	}
 	log.Printf("commit took %v queue %d", time.Since(before), a.batch.Len())
 	a.batch = pgx.Batch{}
 	a.lastCommitTime = time.Now()
@@ -308,7 +311,7 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 				vals = append(vals, val)
 			}
 		}
-		query += ") VALUES("
+		query += ") overriding system value VALUES("
 		for idx := range logicalMsg.Tuple.Columns {
 			if idx == 0 {
 				query += fmt.Sprintf("$%d", idx+1)
