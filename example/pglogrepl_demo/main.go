@@ -228,6 +228,7 @@ func (a *applyContext) queue(q string, args ...interface{}) {
 
 func (a *applyContext) begin() {
 	a.txnInProgress = true
+	a.timer.Stop()
 }
 
 func (a *applyContext) commit(commitLSN pglogrepl.LSN, commitTime time.Time) {
